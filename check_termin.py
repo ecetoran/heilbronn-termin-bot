@@ -1,21 +1,26 @@
-"""Heilbronn Ausländerbehörde - randevu takip botu.
+"""Heilbronn Ausländerbehörde - randevu takip botu (hızlı sürüm).
 
 etermin.net'teki "issue of a residence permit" (ilk oturum izni) hizmeti için
 EN ERKEN boş günü kontrol eder. Daha erken bir gün açıldığında (ör. biri
-randevusunu iptal ettiğinde) Telegram'dan mesaj atar.
+randevusunu iptal ettiğinde) Telegram'dan, o günün saatleriyle birlikte
+mesaj atar.
+
+GitHub her 5 dakikada bir çalıştırır; her çalıştırmada CHECKS_PER_RUN kez,
+CHECK_INTERVAL_SEC saniye arayla kontrol eder (varsayılan: 4 kez, dakikada bir).
 
 Ortam değişkenleri (GitHub Secrets / Variables):
   TELEGRAM_BOT_TOKEN  (zorunlu) - @BotFather'dan alınan token
   TELEGRAM_CHAT_ID    (zorunlu) - mesajın gideceği chat id
   MAX_DATE            (isteğe bağlı) - YYYY-MM-DD. Sadece bu tarih ve
                       öncesindeki günler için haber verir.
-  TEST_MODE           (isteğe bağlı) - "true" ise mevcut durumu her halükârda
-                      Telegram'a yollar (kurulum testi).
+  TEST_MODE           (isteğe bağlı) - "true" ise tek kontrol yapar ve mevcut
+                      durumu her halükârda Telegram'a yollar (kurulum testi).
 """
 
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,40 +29,40 @@ from datetime import date
 WEBID = "qtermin-stadtheilbronn-abh"
 SERVICE_ID = 144511       # "issue of a residence permit"
 DURATION_MIN = 20         # bu hizmetin süresi (1 kişi x 20 dk)
-BOOKING_URL = "https://www.etermin.net/qtermin-stadtheilbronn-abh?lang=en"
+# Bu link takvimi doğrudan bu hizmet seçili olarak açar:
+BOOKING_URL = f"https://www.etermin.net/{WEBID}/serviceid/{SERVICE_ID}?lang=en"
 STATE_FILE = "state/state.json"
-FAILS_BEFORE_WARNING = 3  # art arda kaç hatadan sonra uyarı atılsın
+CHECKS_PER_RUN = int(os.environ.get("CHECKS_PER_RUN", "4"))
+CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "60"))
+FAILS_BEFORE_WARNING = 10  # art arda kaç başarısız kontrolden sonra uyarı atılsın
 
 GUNLER = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
 
+# Parametreler sitenin kendi sayfasının gönderdiği istekten kopyalandı.
+COMMON_PARAMS = {
+    "serviceid": SERVICE_ID,
+    "capacity": 1,
+    "caching": "false",
+    "duration": DURATION_MIN,
+    "cluster": "false",
+    "slottype": 0,
+    "fillcalendarstrategy": 0,
+    "showavcap": "false",
+    "appfuture": 270,
+    "appdeadline": 480,
+    "appdeadlinewm": 1,
+    "oneoff": "null",
+    "msdcm": 0,
+    "calendarid": "",
+}
 
-def fetch_available_days():
-    """Bugünden itibaren ilk boş günü ve o ayın kalan boş günlerini döndürür.
 
-    Sitenin 'rangesearch' sorgusu verilen tarihten ileriye bakar, ilk boş
-    günü bulur ve o günden ay sonuna kadarki boş günleri listeler. Yani
-    listenin ilk elemanı her zaman EN ERKEN boş gündür.
-    Parametreler sitenin kendi sayfasının gönderdiği istekten kopyalandı.
-    """
-    params = {
-        "date": date.today().isoformat(),
-        "serviceid": SERVICE_ID,
-        "rangesearch": 1,
-        "caching": "false",
-        "capacity": 1,
-        "duration": DURATION_MIN,
-        "cluster": "false",
-        "slottype": 0,
-        "fillcalendarstrategy": 0,
-        "showavcap": "false",
-        "appfuture": 270,
-        "appdeadline": 480,
-        "appdeadlinewm": 1,
-        "oneoff": "null",
-        "msdcm": 0,
-        "calendarid": "",
-    }
-    url = "https://www.etermin.net/api/timeslots?" + urllib.parse.urlencode(params)
+def api_get(extra_params):
+    params = dict(COMMON_PARAMS, **extra_params)
+    # quote_via=quote: boşlukları sitenin kendisi gibi %20 olarak kodlar
+    url = "https://www.etermin.net/api/timeslots?" + urllib.parse.urlencode(
+        params, quote_via=urllib.parse.quote
+    )
     req = urllib.request.Request(
         url,
         headers={
@@ -71,7 +76,30 @@ def fetch_available_days():
         data = json.loads(resp.read().decode("utf-8"))
     if not isinstance(data, list):
         raise ValueError(f"Beklenmeyen cevap: {str(data)[:200]}")
+    return data
+
+
+def fetch_available_days():
+    """Bugünden itibaren ilk boş günü ve o ayın kalan boş günlerini döndürür.
+
+    'rangesearch' sorgusu verilen tarihten ileriye bakar, ilk boş günü bulur
+    ve o günden ay sonuna kadarki boş günleri listeler. Yani listenin ilk
+    elemanı her zaman EN ERKEN boş gündür.
+    """
+    data = api_get({"date": date.today().isoformat(), "rangesearch": 1})
     return sorted({d["start"][:10] for d in data if d.get("available", 0) > 0})
+
+
+def fetch_times(day):
+    """Verilen gündeki boş saatleri (ör. ['08:30', '08:50']) döndürür."""
+    data = api_get(
+        {
+            "date": day,
+            "tz": "W. Europe Standard Time",
+            "tzaccount": "W. Europe Standard Time",
+        }
+    )
+    return sorted({d["start"][11:16] for d in data if d.get("start", "")[:10] == day})
 
 
 def tr_date(iso):
@@ -117,14 +145,21 @@ def save_state(state):
         json.dump(state, f)
 
 
-def main():
-    max_date = os.environ.get("MAX_DATE", "").strip()
-    test_mode = os.environ.get("TEST_MODE", "").strip().lower() == "true"
+def times_text(day):
+    try:
+        times = fetch_times(day)
+    except Exception as e:  # saatler alınamazsa bildirim yine gitsin
+        print(f"Saatler alınamadı: {e}")
+        return ""
+    if not times:
+        return ""
+    shown = ", ".join(times[:8])
+    more = f" (+{len(times) - 8} saat daha)" if len(times) > 8 else ""
+    return f"Saatler: {shown}{more}\n"
 
-    prev = load_state()
-    state = dict(prev) if prev else {"earliest": None, "fail_count": 0}
 
-    # 1) Siteyi oku
+def check_once(state, first_run, test_mode, max_date):
+    """Tek bir kontrol yapar, gerekirse mesaj atar, state'i günceller."""
     try:
         days = fetch_available_days()
     except Exception as e:
@@ -139,44 +174,56 @@ def main():
                 "değişmiş olabilir. Bu sırada randevulara elle bakmanı öneririm:\n"
                 f"{BOOKING_URL}"
             )
-        save_state(state)
-        return  # GitHub'dan her 10 dakikada hata e-postası gelmesin diye
+        return
 
     if state.get("fail_count", 0) >= FAILS_BEFORE_WARNING:
         send_telegram("✅ Randevu botu tekrar normal çalışıyor.")
     state["fail_count"] = 0
 
     earliest = days[0] if days else None
-    prev_earliest = prev.get("earliest") if prev else None
-    print(f"En erken boş gün: {earliest} (önceki kontrol: {prev_earliest})")
-    print(f"Bu aydaki boş günler: {days}")
+    prev_earliest = state.get("earliest")
+    print(f"En erken boş gün: {earliest} (önceki: {prev_earliest})")
 
-    # 2) Haber verilecek mi?
     if test_mode:
         send_telegram(
-            "✅ Randevu botu çalışıyor!\n\n"
+            "✅ Randevu botu çalışıyor! (hızlı sürüm)\n\n"
             f"Şu an en erken boş gün: {tr_date(earliest) if earliest else 'yok'}\n"
-            f"Tarih filtresi: {max_date or 'yok'}\n\n"
-            "Bundan sonra daha erken bir gün açılınca sana yazacağım.\n"
+            + (times_text(earliest) if earliest else "")
+            + f"Tarih filtresi: {max_date or 'yok'}\n\n"
+            "Daha erken bir gün açılınca sana hemen yazacağım.\n"
             f"{BOOKING_URL}"
         )
-    elif prev is None:
+    elif first_run:
         print("İlk çalıştırma: en erken gün kaydedildi, mesaj atılmadı.")
     elif earliest and (prev_earliest is None or earliest < prev_earliest):
         if not max_date or earliest <= max_date:
-            others = [date.fromisoformat(d).strftime("%d.%m") for d in days[1:6]]
             send_telegram(
                 "📅 DAHA ERKEN RANDEVU AÇILDI!\n\n"
-                f"En erken gün: {tr_date(earliest)}\n"
+                f"Gün: {tr_date(earliest)}\n"
+                + times_text(earliest)
                 + (f"(önceki en erken: {tr_date(prev_earliest)})\n" if prev_earliest else "")
-                + (f"Aynı aydaki diğer günler: {', '.join(others)}\n" if others else "")
                 + f"\nHemen al 👉 {BOOKING_URL}\n"
-                "residence permit > issue of a residence permit > +"
+                "(Link takvimi doğrudan açar: saati seç → Continue)"
             )
             print("Bildirim gönderildi.")
 
     state["earliest"] = earliest
-    save_state(state)
+
+
+def main():
+    max_date = os.environ.get("MAX_DATE", "").strip()
+    test_mode = os.environ.get("TEST_MODE", "").strip().lower() == "true"
+
+    prev = load_state()
+    first_run = prev is None
+    state = dict(prev) if prev else {"earliest": None, "fail_count": 0}
+
+    checks = 1 if test_mode else max(1, CHECKS_PER_RUN)
+    for i in range(checks):
+        if i > 0:
+            time.sleep(CHECK_INTERVAL_SEC)
+        check_once(state, first_run and i == 0, test_mode, max_date)
+        save_state(state)
 
 
 if __name__ == "__main__":
