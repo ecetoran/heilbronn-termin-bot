@@ -1,0 +1,40 @@
+name: Heilbronn randevu kontrolü
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # her 10 dakikada bir (GitHub bazen birkaç dakika geciktirebilir)
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Telegram'a test mesajı gönder"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: termin-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Önceki kontrolün sonucunu yükle
+        uses: actions/cache@v5
+        with:
+          path: state
+          key: termin-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: termin-state-
+
+      - name: Randevuları kontrol et
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAX_DATE: ${{ vars.MAX_DATE }}
+          TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.test_mode }}
+        run: python3 check_termin.py
